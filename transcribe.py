@@ -1,0 +1,298 @@
+"""Audio/video file -> notes (piano model, Basic Pitch, or Demucs + Basic Pitch) -> sheet music (music21)."""
+import math
+import subprocess
+from pathlib import Path
+
+import imageio_ffmpeg
+from music21 import chord, clef, instrument, key, layout, metadata, meter, note, stream, tempo
+
+# name -> (music21 instrument class, lowest, highest sounding MIDI pitch, plays chords?)
+INSTRUMENTS = {
+    "piano": (instrument.Piano, 21, 108, True),
+    "guitar": (instrument.AcousticGuitar, 40, 88, True),
+    "violin": (instrument.Violin, 55, 100, False),
+    "flute": (instrument.Flute, 60, 96, False),
+    "cello": (instrument.Violoncello, 36, 76, False),
+    "clarinet (Bb)": (instrument.Clarinet, 50, 91, False),
+    "trumpet (Bb)": (instrument.Trumpet, 54, 82, False),
+    "alto sax (Eb)": (instrument.AltoSaxophone, 49, 81, False),
+}
+GRID = 4  # subdivisions per quarter note, i.e. 16th-note quantization
+
+
+def extract_audio(src, dst, channels=1, rate=22050):
+    """Decode any audio/video file to WAV with the bundled ffmpeg."""
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(src), "-vn", "-ac", str(channels), "-ar", str(rate), str(dst)]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise ValueError("Could not read audio from this file: " + r.stderr.strip().splitlines()[-1])
+
+
+PIANO_CKPT = Path(__file__).parent / "models" / "piano_note_pedal.pth"
+_piano_model = None
+
+
+def _piano_events(y):
+    """Piano-specific model (Kong et al. 2020); far fewer ghost notes than Basic Pitch on piano recordings."""
+    global _piano_model
+    import torch
+    from piano_transcription_inference import PianoTranscription
+
+    if _piano_model is None:
+        if not PIANO_CKPT.exists():
+            raise ValueError(f"Piano model missing: download it to {PIANO_CKPT} (see README).")
+        _piano_model = PianoTranscription(checkpoint_path=str(PIANO_CKPT), device=torch.device("cpu"))
+        # Pedal output is never notated, so run only the note network (about half the CPU time).
+        _piano_model.model = _piano_model.model.note_model
+    ev = _piano_model.transcribe(y, None)["est_note_events"]
+    return [(e["onset_time"], e["offset_time"], e["midi_note"]) for e in ev]
+
+
+def isolate_lead(stereo_wav, dst):
+    """Strip drums, bass, guitar and piano with Demucs htdemucs_6s; write vocals+other (where lead lines land)."""
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from demucs.apply import apply_model
+    from demucs.pretrained import get_model
+
+    model = get_model("htdemucs_6s")
+    model.eval()
+    wav, sr = sf.read(str(stereo_wav), dtype="float32", always_2d=True)
+    wav = torch.from_numpy(wav.T.copy())
+    ref = wav.mean(0)
+    mean, std = ref.mean(), ref.std() + 1e-8
+    with torch.no_grad():
+        src = apply_model(model, ((wav - mean) / std)[None], device="cpu", progress=False)[0] * std + mean
+    lead = src[model.sources.index("vocals")] + src[model.sources.index("other")]
+    sf.write(str(dst), lead.mean(0).numpy(), sr)
+
+
+def _melody(events):
+    """Keep one note at a time: loudest first, dropping any note that mostly overlaps a louder kept note."""
+    # ponytail: greedy loudness skyline; a trained melody-extraction model is the upgrade for dense mixes.
+    kept = []
+    for s, e, p, amp, *_ in sorted(events, key=lambda ev: -ev[3]):
+        if all(min(e, ke) - max(s, ks) < 0.5 * (e - s) for ks, ke, _ in kept):
+            kept.append((s, e, p))
+    return kept
+
+
+def _smooth_line(notes):
+    """Fold octave jumps toward the local median pitch, then merge same-pitch fragments split by vibrato or bowing."""
+    import numpy as np
+
+    notes = sorted(notes)
+    ps = [p for _, _, p in notes]
+    out = []
+    for i, (s, e, p) in enumerate(notes):
+        # ponytail: a real leap of more than a sixth from the surrounding 17 notes gets folded too.
+        med = float(np.median(ps[max(0, i - 8): i + 9]))
+        while p - med > 9:
+            p -= 12
+        while med - p > 9:
+            p += 12
+        if out and out[-1][2] == p and s - out[-1][1] < 0.1:
+            out[-1] = (out[-1][0], max(e, out[-1][1]), p)
+        else:
+            out.append((s, e, p))
+    return out
+
+
+def _fold_beats(beats):
+    """Halve or double the beat track until it sits in 60-180 BPM."""
+    import numpy as np
+
+    # ponytail: beat trackers often lock onto half/double time; folding into 60-180 is a heuristic.
+    while len(beats) > 2 and np.median(np.diff(beats)) < 60 / 180:
+        beats = beats[::2]
+    while len(beats) > 1 and np.median(np.diff(beats)) > 1.0:
+        beats = np.sort(np.concatenate([beats, (beats[:-1] + beats[1:]) / 2]))
+    return beats
+
+
+SOURCES = ("piano", "other", "lead")  # piano recording / solo instrument or voice / lead line of a full song
+
+
+def detect_notes(wav, source="piano", lead_wav=None):
+    """Return ([(start_s, end_s, midi_pitch)], beat_times_s); beats always come from the full mix in wav."""
+    import librosa
+    import numpy as np
+
+    y, sr = librosa.load(str(wav), sr=22050)
+    if source == "piano":
+        events = _piano_events(librosa.resample(y, orig_sr=sr, target_sr=16000))
+    else:
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+        from basic_pitch.inference import predict
+
+        # Stricter than defaults (0.5/0.3/127 ms) to cut ghost notes.
+        _, _, events = predict(str(lead_wav or wav), ICASSP_2022_MODEL_PATH, onset_threshold=0.6,
+                               frame_threshold=0.4, minimum_note_length=100)
+        if source == "lead":
+            # G3-E7 covers violin, flute and most voices; outside it is almost always harmonics or bleed.
+            events = _smooth_line(_melody([ev for ev in events if 55 <= ev[2] <= 100]))
+    beats = _fold_beats(np.asarray(librosa.beat.beat_track(y=y, sr=sr, units="time")[1], dtype=float))
+    return sorted((float(s), float(e), int(p)) for s, e, p, *_ in events), beats
+
+
+def _beat_clock(beats, t_end):
+    """Map seconds -> beat position along the detected beats, so rubato doesn't drift off the grid."""
+    import numpy as np
+
+    iv = float(np.median(np.diff(beats)))
+    pre = beats[0] - iv * np.arange(int(np.ceil(beats[0] / iv)), 0, -1)
+    post = beats[-1] + iv * np.arange(1, int(np.ceil(max(t_end - beats[-1], 0) / iv)) + 2)
+    grid = np.concatenate([pre, beats, post])
+    idx = np.arange(len(grid), dtype=float)
+    return lambda t: float(np.interp(t, grid, idx)), round(60 / iv)
+
+
+def _fold(p, lo, hi):
+    while p < lo:
+        p += 12
+    while p > hi:
+        p -= 12
+    return p
+
+
+def _beat_of(b):
+    """Beat index a beat position belongs to; onsets up to a 32nd early count as the next beat."""
+    return math.floor(b + 1 / 8)
+
+
+def _grids(onsets):
+    """Pick one grid per beat (16ths or 8th-triplets) so a beat never mixes both; triplets must fit clearly better."""
+    groups = {}
+    for a in onsets:
+        groups.setdefault(_beat_of(a), []).append(a)
+    err = lambda xs, g: sum(abs(x - round(x * g) / g) for x in xs)
+    return {k: 3 if err(xs, 3) < 0.7 * err(xs, GRID) else GRID for k, xs in groups.items()}
+
+
+def _quantize(notes, to_beats, lo, hi, poly):
+    """Seconds -> quarter-length grid, fold into range; monophonic instruments keep the top note."""
+    starts = [to_beats(s) for s, _, _ in notes]
+    grids = _grids(starts)
+    out = []
+    for (_, e, p), a in zip(notes, starts):
+        g = grids[_beat_of(a)]
+        s, b = round(a * g) / g, to_beats(e)
+        ge = grids.get(_beat_of(b), g)
+        out.append((s, max(round(b * ge) / ge, s + 1 / g), _fold(p, lo, hi)))
+    if poly:
+        return out
+    # ponytail: "melody = highest note at each onset" is naive; a real melody extractor would be the upgrade.
+    top = {}
+    for s, e, p in out:
+        if s not in top or p > top[s][1]:
+            top[s] = (e, p)
+    starts = sorted(top)
+    line = []
+    for i, s in enumerate(starts):
+        e, p = top[s]
+        if i + 1 < len(starts):
+            nxt = starts[i + 1]
+            e = nxt if nxt - e <= 0.5 else min(e, nxt)  # close gaps under half a beat instead of writing tiny rests
+        line.append((s, e, p))
+    return line
+
+
+def _part(notes, inst, cl, ts, ks, cls=stream.Part):
+    """Build one staff; chordify splits overlapping notes into tied chords so the staff has a single voice."""
+    raw = stream.Stream()
+    for s, e, p in notes:
+        n = note.Note(p)
+        n.quarterLength = e - s
+        raw.insert(s, n)
+    part = cls()
+    for obj in (inst, cl, ts, ks):
+        part.insert(0, obj)
+    if notes:
+        for el in raw.chordify().flatten().notes:
+            if isinstance(el, chord.Chord) and len(el.pitches) == 1:
+                el = _single(el)
+            part.insert(el.offset, el)
+    else:
+        part.insert(0, note.Rest(quarterLength=4))
+    return part
+
+
+def _single(c):
+    n = note.Note(c.pitches[0])
+    n.duration = c.duration
+    n.tie = c.tie
+    n.offset = c.offset
+    return n
+
+
+def build_score(notes, bpm, name="piano", title="Transcription", to_beats=None):
+    """Turn [(start_s, end_s, midi)] into a Score; to_beats maps seconds to beats (default: steady bpm)."""
+    cls, lo, hi, poly = INSTRUMENTS[name]
+    notes = _quantize(notes, to_beats or (lambda t: t * bpm / 60), lo, hi, poly)
+    # Pedal makes recorded notes ring into the next ones; notate each note only until the next onset (any staff).
+    # ponytail: this also shortens a held melody note under a moving arpeggio; voice separation is the upgrade.
+    onsets = sorted({s for s, _, _ in notes})
+    nxt = dict(zip(onsets, onsets[1:]))
+    notes = sorted({(s, min(e, nxt.get(s, e)), p) for s, e, p in notes})
+    probe = stream.Stream([note.Note(p) for _, _, p in notes])
+    # ponytail: assumes 4/4 and uses music21's default sharp spelling; the key signature is a best guess.
+    ks = probe.analyze("key") if notes else key.Key("C")
+    ts = meter.TimeSignature("4/4")
+
+    score = stream.Score()
+    score.metadata = metadata.Metadata(title=title)
+    if name == "piano":
+        rh = _part([n for n in notes if n[2] >= 60], instrument.Piano(), clef.TrebleClef(),
+                   ts, ks, stream.PartStaff)
+        lh = _part([n for n in notes if n[2] < 60], instrument.Piano(), clef.BassClef(),
+                   meter.TimeSignature("4/4"), key.KeySignature(ks.sharps), stream.PartStaff)
+        score.insert(0, rh)
+        score.insert(0, lh)
+        score.insert(0, layout.StaffGroup([rh, lh], symbol="brace", barTogether=True))
+    else:
+        c = {"guitar": clef.Treble8vbClef(), "cello": clef.BassClef()}.get(name, clef.TrebleClef())
+        part = _part(notes, cls(), c, ts, ks)
+        part.atSoundingPitch = True
+        score.insert(0, part)
+    score.parts[0].insert(0, tempo.MetronomeMark(number=bpm))
+    return score
+
+
+def _tempo_map(notes, beats):
+    """Return (seconds -> beats function, bpm) that follows the detected beats; (None, 120) if there are too few."""
+    if len(beats) < 2:
+        return None, 120
+    clock, bpm = _beat_clock(beats, max(e for _, e, _ in notes))
+    # Beat trackers place beats a little early or late; shift so most onsets land on the beat.
+    # ponytail: median phase assumes most notes start on beats; syncopated music may shift wrongly.
+    phase = sorted(clock(s) - round(clock(s)) for s, _, _ in notes)[len(notes) // 2]
+    shift = phase if phase <= 0 else phase - 1  # never push early notes below offset 0
+    return (lambda t: clock(t) - shift), bpm
+
+
+def transcribe(src, out_dir, name="piano", bpm=None, source="piano"):
+    """Full pipeline; writes score.musicxml and score.mid into out_dir and returns a summary dict."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wav, stereo, lead = out_dir / "audio.wav", out_dir / "stereo.wav", out_dir / "lead.wav"
+    try:
+        extract_audio(src, wav)
+        if source == "lead":
+            extract_audio(src, stereo, channels=2, rate=44100)  # Demucs expects 44.1 kHz stereo
+            isolate_lead(stereo, lead)
+        notes, beats = detect_notes(wav, source, lead if source == "lead" else None)
+    finally:
+        for f in (wav, stereo, lead):
+            f.unlink(missing_ok=True)
+    if not notes:
+        raise ValueError("No notes were detected in this file.")
+    to_beats = None
+    if bpm is None:  # follow the performer's tempo; a user-typed BPM means a steady grid instead
+        to_beats, bpm = _tempo_map(notes, beats)
+    score = build_score(notes, bpm, name, Path(src).stem, to_beats)
+    score.write("midi", fp=out_dir / "score.mid")  # MIDI stays at sounding pitch
+    if score.parts[0].atSoundingPitch is True:
+        score = score.toWrittenPitch()
+    score.write("musicxml", fp=out_dir / "score.musicxml")
+    return {"notes": len(notes), "bpm": bpm, "instrument": name}

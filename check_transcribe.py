@@ -1,0 +1,77 @@
+"""Self-check: score building for every instrument, then full pipeline on a synthetic C-major scale."""
+import tempfile
+import wave
+from pathlib import Path
+
+import numpy as np
+from music21 import converter
+
+from transcribe import INSTRUMENTS, build_score, transcribe
+
+SCALE = [60, 62, 64, 65, 67, 69, 71, 72]
+
+# 1. Score building: a C-major chord plus a bass note, at 120 BPM (0.5 s = 1 quarter).
+notes = [(0.0, 1.0, 48), (0.0, 1.0, 60), (0.0, 1.0, 64), (0.0, 1.0, 67), (1.0, 1.5, 72)]
+for name, (_, lo, hi, poly) in INSTRUMENTS.items():
+    s = build_score(notes, 120, name)
+    with tempfile.TemporaryDirectory() as d:
+        s.write("musicxml", fp=Path(d) / "x.musicxml")
+        back = converter.parse(Path(d) / "x.musicxml")
+    sounding = [p.midi for p in back.toSoundingPitch().flatten().pitches]
+    assert sounding, name
+    assert all(lo <= p <= hi for p in sounding), (name, sounding)
+    if name == "piano":
+        assert len(back.parts) == 2 and 48 in sounding and 72 in sounding, sounding
+    if not poly:
+        assert not back.flatten().getElementsByClass("Chord"), name
+print("score building ok for", len(INSTRUMENTS), "instruments")
+
+# 1b. Pedal overlap: an arpeggio whose notes each ring 2 s must not turn into stacked chords.
+arp = [(i * 0.25, i * 0.25 + 2.0, p) for i, p in enumerate([60, 64, 67, 72])]
+flat = build_score(arp, 120, "piano").parts[0].flatten()
+assert not flat.getElementsByClass("Chord"), [c.pitches for c in flat.getElementsByClass("Chord")]
+# 1c. Triplets snap to the triplet grid instead of 16ths (1/3 s at 60 BPM = 1/3 quarter).
+trip = build_score([(i / 3, (i + 1) / 3, 64) for i in range(6)], 60, "piano").parts[0].flatten().notes
+assert [round(float(n.offset), 3) for n in trip] == [round(i / 3, 3) for i in range(6)], [n.offset for n in trip]
+# 1d. Rubato: beats that slow from 0.5 s to 0.7 s apart still put one note on each beat.
+import numpy as np
+from transcribe import _beat_clock
+beats = np.cumsum(np.linspace(0.5, 0.7, 12))
+clock, _ = _beat_clock(beats, beats[-1])
+rub = build_score([(a, b, 64) for a, b in zip(beats, beats[1:])], 60, "piano", to_beats=clock).parts[0].flatten().notes
+offs = [float(n.offset) for n in rub]
+assert offs == [offs[0] + i for i in range(11)], offs
+assert all(n.quarterLength == 1 or n.tie for n in rub), [(n.quarterLength, n.tie) for n in rub]
+# 1e. Pedal trim works across staves: bass G#3 onset cuts the ringing treble E4.
+tr = build_score([(0, 2, 64), (0.5, 2, 56)], 120, "piano")
+assert tr.parts[0].flatten().notes[0].quarterLength == 1, tr.parts[0].flatten().notes[0].quarterLength
+# 1f. Melody skyline: loud lead wins over quieter overlapping accompaniment; non-overlapping notes survive.
+from transcribe import _melody
+mel = _melody([(0, 1, 76, 0.9), (0, 1, 69, 0.5), (0.2, 0.8, 64, 0.4), (1, 2, 72, 0.3)])
+assert sorted(mel) == [(0, 1, 76), (1, 2, 72)], mel
+# 1g. Line smoothing: an octave-jump harmonic folds back and merges with the same pitch before it.
+from transcribe import _smooth_line
+assert _smooth_line([(0, 0.5, 76), (0.5, 1, 88), (1, 1.5, 74)]) == [(0, 1, 76), (1, 1.5, 74)]
+# 1h. One grid per beat: 16ths in beat 1 and triplets in beat 2 each stay exact, with no rests between.
+mix = [(i * 0.25, (i + 1) * 0.25, 67) for i in range(4)] + [(1 + i / 3, 1 + (i + 1) / 3, 69) for i in range(3)]
+got = [(round(float(n.offset), 3), n.quarterLength) for n in build_score(mix, 60, "violin").parts[0].flatten().notesAndRests]
+want = [(0.0, 0.25), (0.25, 0.25), (0.5, 0.25), (0.75, 0.25), (1.0, 1 / 3), (1.333, 1 / 3), (1.667, 1 / 3)]
+assert [o for o, _ in got[:7]] == [o for o, _ in want] and all(abs(float(a) - b) < 1e-6 for (_, a), (_, b) in zip(got, want)), got
+print("pedal trim, triplet grid, rubato tempo map, melody skyline, line smoothing and per-beat grid ok")
+
+# 2. End to end: synthesize a scale (0.5 s per note) and transcribe it.
+sr = 22050
+t = np.arange(int(sr * 0.5)) / sr
+env = np.minimum(1, np.minimum(t, t[::-1]) * 40)
+audio = np.concatenate([np.sin(2 * np.pi * 440 * 2 ** ((m - 69) / 12) * t) * env for m in SCALE])
+with tempfile.TemporaryDirectory() as d:
+    wav = Path(d) / "scale.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(sr)
+        w.writeframes((audio * 20000).astype("<i2").tobytes())
+    info = transcribe(wav, Path(d) / "out", "piano", bpm=120, source="other")  # sine tones aren't piano
+    got = [p.midi for p in converter.parse(Path(d) / "out" / "score.musicxml").flatten().pitches]
+    assert (Path(d) / "out" / "score.mid").stat().st_size > 0
+missing = set(SCALE) - set(got)
+assert not missing, (missing, got)
+print("pipeline ok:", info, "pitches:", got)
