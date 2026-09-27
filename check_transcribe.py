@@ -79,6 +79,15 @@ assert [p for *_, p in mel] == [57], mel
 from transcribe import _fold_down
 assert _fold_down([(0, 1, 76), (1, 2, 88), (2, 3, 74)]) == [(0, 1, 76), (1, 2, 76), (2, 3, 74)]
 assert _fold_down([(0, 1, 74), (1, 2, 76), (2, 3, 57), (3, 4, 74)])[2] == (2, 3, 57)
+# 1k. Zigzag fix: stray A3s between A4/E5 notes move up an octave; a low-med-low phrase ending stays low, and an
+# out-and-back leap separated by pauses is left alone.
+from transcribe import _unspike
+zig = [(0, .3, 69), (.3, .5, 57), (.5, .8, 76), (.8, 1, 57), (1, 1.3, 69)]
+assert [p for *_, p in _unspike(zig)] == [69, 69, 76, 69, 69], _unspike(zig)
+end = [(0, .5, 72), (.5, 1, 71), (1, 1.5, 59), (1.5, 2, 64), (2, 2.5, 59)]
+assert _unspike(end) == end, _unspike(end)
+apart = [(0, .5, 76), (1, 1.5, 57), (2, 2.5, 76)]
+assert _unspike(apart) == apart, _unspike(apart)
 # 1j. No hanging note: a sustained A3 drone outweighs nothing, but its steady probability would keep the tracker on
 # it through a fast A4-E5-A4-C5 figure; each attack must start a new note instead.
 T = 172

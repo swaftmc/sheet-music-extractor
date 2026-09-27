@@ -113,7 +113,7 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
             # another pitch attacks, the held pitch is not re-attacked, and Basic Pitch rates the new pitch higher.
             # This uses Basic Pitch's own probabilities because the harmonic sum rates a note and the pitch whose
             # overtone it is (an octave or a twelfth below) about equally. A strong attack on the held pitch is a
-            # new bow stroke. When a figure's note fades, the note goes back to the tracked pitch.
+            # new bow stroke.
             segs, last = [(t, q)], t
             for k in range(t + 6, u - 6):
                 cur = segs[-1][1]
@@ -128,14 +128,33 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
                     if r is not None and cur not in hit and now[r] > now[cur]:
                         segs.append((k, r))
                         last = k
-                        continue
-                if cur != q and raw[k - 2:k + 1, cur].mean() < 0.3:
-                    segs.append((k, q))
             bounds = [a for a, _ in segs] + [u]
             notes += [(float(times[a]), float(times[min(b, T - 1)]), lo + int(r))
                       for (a, r), b in zip(segs, bounds[1:]) if b - a >= 6]  # drop blips under ~70 ms
         t = u
-    return _fold_down(notes)
+    return _unspike(_fold_down(notes))
+
+
+def _unspike(notes, gap=9, pause=0.25):
+    """Move a note (or run of repeats) by octaves toward its neighbours when it leaps 9+ semitones away from both
+    in the same direction. Such out-and-back leaps come from the backing or an overtone, not the melody."""
+    runs = []  # [first, last] index of each run of same-pitch notes
+    for i, (_, _, p) in enumerate(notes):
+        if runs and notes[runs[-1][1]][2] == p:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    ps = [notes[a][2] for a, _ in runs]
+    out = list(notes)
+    for j in range(1, len(runs) - 1):
+        a, p, b = ps[j - 1], ps[j], ps[j + 1]  # left neighbour is already fixed, so back-to-back spikes resolve
+        first, last = runs[j]
+        # ponytail: a real out-and-back leap over a sixth is left alone only when a pause separates it.
+        near = (notes[first][0] - notes[first - 1][1] < pause) and (notes[last + 1][0] - notes[last][1] < pause)
+        if near and (min(p - a, p - b) >= gap or min(a - p, b - p) >= gap):
+            ps[j] = min((p + 12 * k for k in range(-3, 4)), key=lambda q: (max(abs(q - a), abs(q - b)), abs(q - p)))
+            out[first:last + 1] = [(s, e, ps[j]) for s, e, _ in notes[first:last + 1]]
+    return out
 
 
 def _fold_down(notes):
