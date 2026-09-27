@@ -68,34 +68,57 @@ def isolate_lead(stereo_wav, dst):
     sf.write(str(dst), lead.mean(0).numpy(), sr)
 
 
-def _melody(events):
-    """Keep one note at a time: loudest first, dropping any note that mostly overlaps a louder kept note."""
-    # ponytail: greedy loudness skyline; a trained melody-extraction model is the upgrade for dense mixes.
-    kept = []
-    for s, e, p, amp, *_ in sorted(events, key=lambda ev: -ev[3]):
-        if all(min(e, ke) - max(s, ks) < 0.5 * (e - s) for ks, ke, _ in kept):
-            kept.append((s, e, p))
-    return kept
+def _track_melody(model_output, y, sr, lo=55, hi=100):
+    """Follow one pitch (or a rest) per frame through Basic Pitch's note probabilities with Viterbi, then cut notes.
+    Jumps are penalised so the line stays off the accompaniment, and rests win only where the lead audio goes quiet."""
+    import librosa
+    import numpy as np
+    from basic_pitch.note_creation import model_frames_to_time
+
+    # ponytail: weights tuned on 4 synthetic mixes and one song; a trained melody-extraction model is the upgrade.
+    sal = model_output["note"][:, lo - 21: hi - 20]  # G3-E7: violin, flute and most voices
+    ons = model_output["onset"][:, lo - 21: hi - 20]
+    T, P = sal.shape
+    times = model_frames_to_time(T)
+    # Rest likelihood: 0.2 while the lead plays, rising to 1 once it is 12-18 dB below its typical (75th pct) level.
+    db = librosa.amplitude_to_db(librosa.feature.rms(y=y, frame_length=2048, hop_length=256)[0] + 1e-9)
+    db = np.interp(times, librosa.frames_to_time(np.arange(len(db)), sr=sr, hop_length=256), db)
+    rest = 0.2 + 0.8 * np.clip((np.percentile(db, 75) - 12 - db) / 6, 0, 1)
+    # Staying on a pitch is ~65x likelier than a semitone step; each further semitone costs another e^-0.5.
+    A = np.exp(-np.abs(np.subtract.outer(np.arange(P), np.arange(P))) / 2.0)
+    np.fill_diagonal(A, 40.0)
+    A = np.block([[A, np.full((P, 1), 0.5)], [np.full((1, P), 0.05), np.array([[40.0]])]])
+    path = librosa.sequence.viterbi(np.vstack([sal.T, rest[None]]), A / A.sum(1, keepdims=True))
+    notes, t = [], 0
+    while t < T:
+        u = t
+        while u < T and path[u] == path[t]:
+            u += 1
+        q = path[t]
+        if q < P:
+            # A strong onset peak inside a held pitch is a repeated note (a new bow stroke), not a continuation.
+            cuts = [t] + [k for k in range(t + 6, u - 6) if ons[k, q] > 0.7 and ons[k, q] >= ons[k - 1: k + 2, q].max()]
+            cuts.append(u)
+            notes += [(float(times[a]), float(times[min(b, T - 1)]), lo + int(q))
+                      for a, b in zip(cuts, cuts[1:]) if b - a >= 6]  # drop blips under ~70 ms
+        t = u
+    return _fold_octaves(notes)
 
 
-def _smooth_line(notes):
-    """Fold octave jumps toward the local median pitch, then merge same-pitch fragments split by vibrato or bowing."""
+def _fold_octaves(notes):
+    """Move notes more than a sixth from the local median pitch by an octave; overtones cause most such jumps."""
     import numpy as np
 
-    notes = sorted(notes)
+    # ponytail: a real leap of more than a sixth from the surrounding 17 notes gets folded too.
     ps = [p for _, _, p in notes]
     out = []
     for i, (s, e, p) in enumerate(notes):
-        # ponytail: a real leap of more than a sixth from the surrounding 17 notes gets folded too.
         med = float(np.median(ps[max(0, i - 8): i + 9]))
         while p - med > 9:
             p -= 12
         while med - p > 9:
             p += 12
-        if out and out[-1][2] == p and s - out[-1][1] < 0.1:
-            out[-1] = (out[-1][0], max(e, out[-1][1]), p)
-        else:
-            out.append((s, e, p))
+        out.append((s, e, p))
     return out
 
 
@@ -127,11 +150,10 @@ def detect_notes(wav, source="piano", lead_wav=None):
         from basic_pitch.inference import predict
 
         # Stricter than defaults (0.5/0.3/127 ms) to cut ghost notes.
-        _, _, events = predict(str(lead_wav or wav), ICASSP_2022_MODEL_PATH, onset_threshold=0.6,
-                               frame_threshold=0.4, minimum_note_length=100)
+        model_output, _, events = predict(str(lead_wav or wav), ICASSP_2022_MODEL_PATH, onset_threshold=0.6,
+                                          frame_threshold=0.4, minimum_note_length=100)
         if source == "lead":
-            # G3-E7 covers violin, flute and most voices; outside it is almost always harmonics or bleed.
-            events = _smooth_line(_melody([ev for ev in events if 55 <= ev[2] <= 100]))
+            events = _track_melody(model_output, librosa.load(str(lead_wav), sr=sr)[0], sr)
     beats = _fold_beats(np.asarray(librosa.beat.beat_track(y=y, sr=sr, units="time")[1], dtype=float))
     return sorted((float(s), float(e), int(p)) for s, e, p, *_ in events), beats
 

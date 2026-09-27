@@ -45,19 +45,30 @@ assert all(n.quarterLength == 1 or n.tie for n in rub), [(n.quarterLength, n.tie
 # 1e. Pedal trim works across staves: bass G#3 onset cuts the ringing treble E4.
 tr = build_score([(0, 2, 64), (0.5, 2, 56)], 120, "piano")
 assert tr.parts[0].flatten().notes[0].quarterLength == 1, tr.parts[0].flatten().notes[0].quarterLength
-# 1f. Melody skyline: loud lead wins over quieter overlapping accompaniment; non-overlapping notes survive.
-from transcribe import _melody
-mel = _melody([(0, 1, 76, 0.9), (0, 1, 69, 0.5), (0.2, 0.8, 64, 0.4), (1, 2, 72, 0.3)])
-assert sorted(mel) == [(0, 1, 76), (1, 2, 72)], mel
-# 1g. Line smoothing: an octave-jump harmonic folds back and merges with the same pitch before it.
-from transcribe import _smooth_line
-assert _smooth_line([(0, 0.5, 76), (0.5, 1, 88), (1, 1.5, 74)]) == [(0, 1, 76), (1, 1.5, 74)]
+# 1f. Melody tracker on a hand-built note-probability grid (~86 frames/s): lead E5, D5, D5 (new bow stroke),
+# a real pause, then G5 with a 3-frame flicker to G#5; a quieter pad on E4 sounds the whole time.
+from transcribe import _track_melody
+T = 320
+note_p, onset_p = np.full((T, 88), 0.01), np.zeros((T, 88))
+note_p[:, 64 - 21] = 0.5
+for a, b, p in [(0, 60, 76), (60, 120, 74), (120, 180, 74), (260, 320, 79)]:
+    note_p[a:b, p - 21] = 0.8
+    onset_p[a, p - 21] = 0.9
+note_p[280:283, 79 - 21], note_p[280:283, 80 - 21] = 0.3, 0.9
+y = np.zeros(T * 256)
+for a, b, amp in [(0, 180, 0.3), (180, 260, 0.003), (260, T, 0.3)]:
+    y[a * 256:b * 256] = amp * np.sin(2 * np.pi * 660 * np.arange((b - a) * 256) / 22050)
+mel = _track_melody({"note": note_p, "onset": onset_p}, y, 22050)
+assert [p for *_, p in mel] == [76, 74, 74, 79], mel
+assert mel[3][0] - mel[2][1] > 0.5, mel  # the pause stays a rest instead of following the pad
+from transcribe import _fold_octaves
+assert _fold_octaves([(0, 1, 76), (1, 2, 88), (2, 3, 74)]) == [(0, 1, 76), (1, 2, 76), (2, 3, 74)]  # overtone folded
 # 1h. One grid per beat: 16ths in beat 1 and triplets in beat 2 each stay exact, with no rests between.
 mix = [(i * 0.25, (i + 1) * 0.25, 67) for i in range(4)] + [(1 + i / 3, 1 + (i + 1) / 3, 69) for i in range(3)]
 got = [(round(float(n.offset), 3), n.quarterLength) for n in build_score(mix, 60, "violin").parts[0].flatten().notesAndRests]
 want = [(0.0, 0.25), (0.25, 0.25), (0.5, 0.25), (0.75, 0.25), (1.0, 1 / 3), (1.333, 1 / 3), (1.667, 1 / 3)]
 assert [o for o, _ in got[:7]] == [o for o, _ in want] and all(abs(float(a) - b) < 1e-6 for (_, a), (_, b) in zip(got, want)), got
-print("pedal trim, triplet grid, rubato tempo map, melody skyline, line smoothing and per-beat grid ok")
+print("pedal trim, triplet grid, rubato tempo map, melody tracker and per-beat grid ok")
 
 # 2. End to end: synthesize a scale (0.5 s per note) and transcribe it.
 sr = 22050

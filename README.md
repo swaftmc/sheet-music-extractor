@@ -10,7 +10,7 @@ Pick "Recording is" to match the file:
 |---|---|---|
 | Piano | Solo piano | Piano model (Kong et al.) |
 | Solo instrument / voice | One instrument or voice, no backing | Basic Pitch |
-| Song with backing: melody only | A lead line (violin, voice, flute) over drums, bass, piano or guitar | Demucs removes the backing, then Basic Pitch and a one-note-at-a-time melody filter |
+| Song with backing: melody only | A lead line (violin, voice, flute) over drums, bass, piano or guitar | Demucs removes the backing, Basic Pitch scores every pitch frame by frame, and a Viterbi tracker follows one continuous line through it |
 
 ## Setup (Python 3.11; Basic Pitch doesn't support 3.14)
 
@@ -41,7 +41,9 @@ Open http://127.0.0.1:5000.
 
 - Works best on one instrument or voice. For songs with backing, use "Song with backing: melody only". Demucs has no violin stem, so strings and pads that share the "other" stem can still leak into the melody.
 - "Song with backing" takes about 1-1.5x the song's length on CPU (separation plus note detection).
-- In "Song with backing" mode, notes that jump more than a sixth away from the surrounding melody are folded back by an octave (this removes harmonics). A real leap that big gets folded too.
+- In "Song with backing" mode, the tracker penalises big jumps, and it writes rests only where the separated lead audio drops about 12 dB below its usual level. A very quiet passage can come out as rests, and a pad that keeps sounding through a real pause can still fill it.
+- Notes that jump more than a sixth away from the surrounding melody are folded back by an octave (this removes harmonics). A real leap that big gets folded too.
+- A repeated note played with a new bow stroke is split only where Basic Pitch sees a clear new onset, so soft re-bows can merge into one long note.
 - Each beat uses either 16ths or triplets, never both, and gaps under half a beat are closed instead of written as rests. Very fast ornaments get simplified.
 - Pedalled notes are notated only until the next note starts, so held bass octaves and melody notes over an arpeggio show up shorter than written.
 - The grid follows the detected beats, so rubato stays aligned. Where the beat tracker slips, a few measures still get odd tuplets.
