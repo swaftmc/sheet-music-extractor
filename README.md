@@ -44,7 +44,7 @@ Open http://127.0.0.1:5000.
 - In "Song with backing" mode, the tracker penalises big jumps, and it writes rests only where the separated lead audio drops about 12 dB below its usual level. A very quiet passage can come out as rests, and a pad that keeps sounding through a real pause can still fill it.
 - Each pitch is scored by the energy at its first 8 harmonics, so low violin notes (whose first overtone can be louder than the note itself) aren't written an octave too high.
 - Notes more than a sixth above the surrounding melody are moved down an octave (this removes overtones). A real high note that far above its neighbours gets moved down too. Low notes are never moved up.
-- A repeated note played with a new bow stroke is split only where Basic Pitch sees a clear new onset, so soft re-bows can merge into one long note.
+- A held note is split wherever another pitch attacks and Basic Pitch rates it higher, so a fast figure over a sustained note isn't written as one long note. Figures faster than about 100 ms per note still get merged, and soft re-bows of the same pitch without a clear attack stay one note.
 - Each beat uses either 16ths or triplets, never both, and gaps under half a beat are closed instead of written as rests. Very fast ornaments get simplified.
 - Pedalled notes are notated only until the next note starts, so held bass octaves and melody notes over an arpeggio show up shorter than written.
 - The grid follows the detected beats, so rubato stays aligned. Where the beat tracker slips, a few measures still get odd tuplets.

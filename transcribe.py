@@ -91,6 +91,7 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
         hs = [(0.84 ** (h - 1), i + int(round(12 * np.log2(h)))) for h in range(1, 9)]
         hs = [(w, j) for w, j in hs if j < M.shape[1]]
         H[:, i] = sum(w * M[:, j] for w, j in hs) / sum(w for w, _ in hs)
+    raw = sal  # Basic Pitch's own note probabilities, used to decide where notes change
     sal = sal * H / (H.max(1, keepdims=True) + 1e-9)
     # Rest likelihood: 0.2 while the lead plays, rising to 1 once it is 12-18 dB below its typical (75th pct) level.
     db = librosa.amplitude_to_db(librosa.feature.rms(y=y, frame_length=2048, hop_length=256)[0] + 1e-9)
@@ -108,11 +109,31 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
             u += 1
         q = path[t]
         if q < P:
-            # A strong onset peak inside a held pitch is a repeated note (a new bow stroke), not a continuation.
-            cuts = [t] + [k for k in range(t + 6, u - 6) if ons[k, q] > 0.7 and ons[k, q] >= ons[k - 1: k + 2, q].max()]
-            cuts.append(u)
-            notes += [(float(times[a]), float(times[min(b, T - 1)]), lo + int(q))
-                      for a, b in zip(cuts, cuts[1:]) if b - a >= 6]  # drop blips under ~70 ms
+            # The stay-put prior can hold one pitch straight through a fast figure (a "hanging" note). Split where
+            # another pitch attacks, the held pitch is not re-attacked, and Basic Pitch rates the new pitch higher.
+            # This uses Basic Pitch's own probabilities because the harmonic sum rates a note and the pitch whose
+            # overtone it is (an octave or a twelfth below) about equally. A strong attack on the held pitch is a
+            # new bow stroke. When a figure's note fades, the note goes back to the tracked pitch.
+            segs, last = [(t, q)], t
+            for k in range(t + 6, u - 6):
+                cur = segs[-1][1]
+                if k - last >= 9:  # at most one attack split per ~100 ms
+                    hit = [r for r in np.nonzero(ons[k] > 0.6)[0] if ons[k, r] >= ons[k - 1: k + 2, r].max()]
+                    now = raw[k:k + 6].mean(0)
+                    r = max(hit, key=lambda r: now[r]) if hit else None
+                    if cur in hit and ons[k, cur] > 0.7:
+                        segs.append((k, cur))
+                        last = k
+                        continue
+                    if r is not None and cur not in hit and now[r] > now[cur]:
+                        segs.append((k, r))
+                        last = k
+                        continue
+                if cur != q and raw[k - 2:k + 1, cur].mean() < 0.3:
+                    segs.append((k, q))
+            bounds = [a for a, _ in segs] + [u]
+            notes += [(float(times[a]), float(times[min(b, T - 1)]), lo + int(r))
+                      for (a, r), b in zip(segs, bounds[1:]) if b - a >= 6]  # drop blips under ~70 ms
         t = u
     return _fold_down(notes)
 

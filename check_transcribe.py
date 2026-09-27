@@ -79,6 +79,19 @@ assert [p for *_, p in mel] == [57], mel
 from transcribe import _fold_down
 assert _fold_down([(0, 1, 76), (1, 2, 88), (2, 3, 74)]) == [(0, 1, 76), (1, 2, 76), (2, 3, 74)]
 assert _fold_down([(0, 1, 74), (1, 2, 76), (2, 3, 57), (3, 4, 74)])[2] == (2, 3, 57)
+# 1j. No hanging note: a sustained A3 drone outweighs nothing, but its steady probability would keep the tracker on
+# it through a fast A4-E5-A4-C5 figure; each attack must start a new note instead.
+T = 172
+note_p, onset_p = np.full((T, 88), 0.01), np.zeros((T, 88))
+note_p[:, 57 - 21] = 0.7
+fig = [(40 + 24 * i, 64 + 24 * i, p) for i, p in enumerate([69, 76, 69, 72])]
+for a, b, p in fig:
+    note_p[a:b, p - 21] = 0.8
+    onset_p[a, p - 21] = 0.9
+y = tones([(a, b, p, 0.3, lead_prof) for a, b, p in fig] + [(0, T, 57, 0.08, [(1, 1.0), (2, 0.5)])], T)
+mel = _track_melody({"note": note_p, "onset": onset_p}, y, 22050)
+assert [p for *_, p in mel if p != 57] == [69, 76, 69, 72], mel
+assert max(e - s for s, e, _ in mel) < 1.0, mel
 # 1i. One grid per beat: 16ths in beat 1 and triplets in beat 2 each stay exact, with no rests between.
 mix = [(i * 0.25, (i + 1) * 0.25, 67) for i in range(4)] + [(1 + i / 3, 1 + (i + 1) / 3, 69) for i in range(3)]
 got = [(round(float(n.offset), 3), n.quarterLength) for n in build_score(mix, 60, "violin").parts[0].flatten().notesAndRests]
