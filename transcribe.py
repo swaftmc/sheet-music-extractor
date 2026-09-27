@@ -80,6 +80,18 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
     ons = model_output["onset"][:, lo - 21: hi - 20]
     T, P = sal.shape
     times = model_frames_to_time(T)
+    # Harmonic sum: score each pitch by the energy at its first 8 harmonics, so a low violin note with a weak
+    # fundamental still beats its own first overtone. Basic Pitch alone often picks that overtone (an octave too high).
+    top = min(122, int(librosa.hz_to_midi(0.45 * sr)))  # highest harmonic bin, kept under Nyquist
+    M = np.abs(librosa.cqt(y, sr=sr, hop_length=256, fmin=librosa.midi_to_hz(lo), n_bins=top - lo + 1)) ** 0.5
+    ct = librosa.frames_to_time(np.arange(M.shape[1]), sr=sr, hop_length=256)
+    M = np.stack([np.interp(times, ct, row) for row in M], 1)
+    H = np.zeros_like(sal)
+    for i in range(P):
+        hs = [(0.84 ** (h - 1), i + int(round(12 * np.log2(h)))) for h in range(1, 9)]
+        hs = [(w, j) for w, j in hs if j < M.shape[1]]
+        H[:, i] = sum(w * M[:, j] for w, j in hs) / sum(w for w, _ in hs)
+    sal = sal * H / (H.max(1, keepdims=True) + 1e-9)
     # Rest likelihood: 0.2 while the lead plays, rising to 1 once it is 12-18 dB below its typical (75th pct) level.
     db = librosa.amplitude_to_db(librosa.feature.rms(y=y, frame_length=2048, hop_length=256)[0] + 1e-9)
     db = np.interp(times, librosa.frames_to_time(np.arange(len(db)), sr=sr, hop_length=256), db)
@@ -102,22 +114,21 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
             notes += [(float(times[a]), float(times[min(b, T - 1)]), lo + int(q))
                       for a, b in zip(cuts, cuts[1:]) if b - a >= 6]  # drop blips under ~70 ms
         t = u
-    return _fold_octaves(notes)
+    return _fold_down(notes)
 
 
-def _fold_octaves(notes):
-    """Move notes more than a sixth from the local median pitch by an octave; overtones cause most such jumps."""
+def _fold_down(notes):
+    """Move a note down an octave while it sits more than a sixth above the local median pitch (an overtone).
+    Never moves notes up: low phrase endings are real, and folding them up wrote them an octave too high."""
     import numpy as np
 
-    # ponytail: a real leap of more than a sixth from the surrounding 17 notes gets folded too.
+    # ponytail: a real high note more than a sixth above the surrounding 17 notes gets folded down too.
     ps = [p for _, _, p in notes]
     out = []
     for i, (s, e, p) in enumerate(notes):
         med = float(np.median(ps[max(0, i - 8): i + 9]))
         while p - med > 9:
             p -= 12
-        while med - p > 9:
-            p += 12
         out.append((s, e, p))
     return out
 
