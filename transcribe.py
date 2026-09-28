@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 
 import imageio_ffmpeg
+import librosa
+import numpy as np
 from music21 import chord, clef, instrument, key, layout, metadata, meter, note, stream, tempo
 
 # name -> (music21 instrument class, lowest, highest sounding MIDI pitch, plays chords?)
@@ -17,6 +19,7 @@ INSTRUMENTS = {
     "trumpet (Bb)": (instrument.Trumpet, 54, 82, False),
     "alto sax (Eb)": (instrument.AltoSaxophone, 49, 81, False),
 }
+SOURCES = ("piano", "other", "lead")  # piano recording / solo instrument or voice / lead line of a full song
 GRID = 4  # subdivisions per quarter note, i.e. 16th-note quantization
 
 
@@ -50,7 +53,6 @@ def _piano_events(y):
 
 def isolate_lead(stereo_wav, dst):
     """Strip drums, bass, guitar and piano with Demucs htdemucs_6s; write vocals+other (where lead lines land)."""
-    import numpy as np
     import soundfile as sf
     import torch
     from demucs.apply import apply_model
@@ -68,15 +70,14 @@ def isolate_lead(stereo_wav, dst):
     sf.write(str(dst), lead.mean(0).numpy(), sr)
 
 
-def _track_melody(model_output, y, sr, lo=55, hi=100):
+def _track_melody(model_output, y, sr):
     """Follow one pitch (or a rest) per frame through Basic Pitch's note probabilities with Viterbi, then cut notes.
     Jumps are penalised so the line stays off the accompaniment, and rests win only where the lead audio goes quiet."""
-    import librosa
-    import numpy as np
     from basic_pitch.note_creation import model_frames_to_time
 
-    # ponytail: weights tuned on 4 synthetic mixes and one song; a trained melody-extraction model is the upgrade.
-    sal = model_output["note"][:, lo - 21: hi - 20]  # G3-E7: violin, flute and most voices
+    # ponytail: weights tuned on 8 synthetic mixes and one song; a trained melody-extraction model is the upgrade.
+    lo, hi = 55, 100  # G3-E7: violin, flute and most voices
+    sal = model_output["note"][:, lo - 21: hi - 20]
     ons = model_output["onset"][:, lo - 21: hi - 20]
     T, P = sal.shape
     times = model_frames_to_time(T)
@@ -91,7 +92,7 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
         hs = [(0.84 ** (h - 1), i + int(round(12 * np.log2(h)))) for h in range(1, 9)]
         hs = [(w, j) for w, j in hs if j < M.shape[1]]
         H[:, i] = sum(w * M[:, j] for w, j in hs) / sum(w for w, _ in hs)
-    raw = sal  # Basic Pitch's own note probabilities, used to decide where notes change
+    prob = sal  # Basic Pitch's own note probabilities, used to decide where notes change
     sal = sal * H / (H.max(1, keepdims=True) + 1e-9)
     # Rest likelihood: 0.2 while the lead plays, rising to 1 once it is 12-18 dB below its typical (75th pct) level.
     db = librosa.amplitude_to_db(librosa.feature.rms(y=y, frame_length=2048, hop_length=256)[0] + 1e-9)
@@ -114,20 +115,20 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
             # This uses Basic Pitch's own probabilities because the harmonic sum rates a note and the pitch whose
             # overtone it is (an octave or a twelfth below) about equally. A strong attack on the held pitch is a
             # new bow stroke.
-            segs, last = [(t, q)], t
+            segs = [(t, q)]
             for k in range(t + 6, u - 6):
-                cur = segs[-1][1]
-                if k - last >= 9:  # at most one attack split per ~100 ms
-                    hit = [r for r in np.nonzero(ons[k] > 0.6)[0] if ons[k, r] >= ons[k - 1: k + 2, r].max()]
-                    now = raw[k:k + 6].mean(0)
-                    r = max(hit, key=lambda r: now[r]) if hit else None
-                    if cur in hit and ons[k, cur] > 0.7:
+                start, cur = segs[-1]
+                if k - start < 9:  # at most one split per ~100 ms
+                    continue
+                hit = [r for r in np.nonzero(ons[k] > 0.6)[0] if ons[k, r] >= ons[k - 1: k + 2, r].max()]
+                now = prob[k:k + 6].mean(0)
+                if cur in hit:
+                    if ons[k, cur] > 0.7:
                         segs.append((k, cur))
-                        last = k
-                        continue
-                    if r is not None and cur not in hit and now[r] > now[cur]:
+                elif hit:
+                    r = max(hit, key=lambda r: now[r])
+                    if now[r] > now[cur]:
                         segs.append((k, r))
-                        last = k
             bounds = [a for a, _ in segs] + [u]
             notes += [(float(times[a]), float(times[min(b, T - 1)]), lo + int(r))
                       for (a, r), b in zip(segs, bounds[1:]) if b - a >= 6]  # drop blips under ~70 ms
@@ -135,9 +136,10 @@ def _track_melody(model_output, y, sr, lo=55, hi=100):
     return _unspike(_fold_down(notes))
 
 
-def _unspike(notes, gap=9, pause=0.25):
+def _unspike(notes):
     """Move a note (or run of repeats) by octaves toward its neighbours when it leaps 9+ semitones away from both
     in the same direction. Such out-and-back leaps come from the backing or an overtone, not the melody."""
+    gap, pause = 9, 0.25  # semitones; seconds of silence that mark a deliberate leap
     runs = []  # [first, last] index of each run of same-pitch notes
     for i, (_, _, p) in enumerate(notes):
         if runs and notes[runs[-1][1]][2] == p:
@@ -160,8 +162,6 @@ def _unspike(notes, gap=9, pause=0.25):
 def _fold_down(notes):
     """Move a note down an octave while it sits more than a sixth above the local median pitch (an overtone).
     Never moves notes up: low phrase endings are real, and folding them up wrote them an octave too high."""
-    import numpy as np
-
     # ponytail: a real high note more than a sixth above the surrounding 17 notes gets folded down too.
     ps = [p for _, _, p in notes]
     out = []
@@ -175,8 +175,6 @@ def _fold_down(notes):
 
 def _fold_beats(beats):
     """Halve or double the beat track until it sits in 60-180 BPM."""
-    import numpy as np
-
     # ponytail: beat trackers often lock onto half/double time; folding into 60-180 is a heuristic.
     while len(beats) > 2 and np.median(np.diff(beats)) < 60 / 180:
         beats = beats[::2]
@@ -185,14 +183,8 @@ def _fold_beats(beats):
     return beats
 
 
-SOURCES = ("piano", "other", "lead")  # piano recording / solo instrument or voice / lead line of a full song
-
-
 def detect_notes(wav, source="piano", lead_wav=None):
     """Return ([(start_s, end_s, midi_pitch)], beat_times_s); beats always come from the full mix in wav."""
-    import librosa
-    import numpy as np
-
     y, sr = librosa.load(str(wav), sr=22050)
     if source == "piano":
         events = _piano_events(librosa.resample(y, orig_sr=sr, target_sr=16000))
@@ -211,8 +203,6 @@ def detect_notes(wav, source="piano", lead_wav=None):
 
 def _beat_clock(beats, t_end):
     """Map seconds -> beat position along the detected beats, so rubato doesn't drift off the grid."""
-    import numpy as np
-
     iv = float(np.median(np.diff(beats)))
     pre = beats[0] - iv * np.arange(int(np.ceil(beats[0] / iv)), 0, -1)
     post = beats[-1] + iv * np.arange(1, int(np.ceil(max(t_end - beats[-1], 0) / iv)) + 2)
@@ -221,7 +211,7 @@ def _beat_clock(beats, t_end):
     return lambda t: float(np.interp(t, grid, idx)), round(60 / iv)
 
 
-def _fold(p, lo, hi):
+def _to_range(p, lo, hi):
     while p < lo:
         p += 12
     while p > hi:
@@ -252,7 +242,7 @@ def _quantize(notes, to_beats, lo, hi, poly):
         g = grids[_beat_of(a)]
         s, b = round(a * g) / g, to_beats(e)
         ge = grids.get(_beat_of(b), g)
-        out.append((s, max(round(b * ge) / ge, s + 1 / g), _fold(p, lo, hi)))
+        out.append((s, max(round(b * ge) / ge, s + 1 / g), _to_range(p, lo, hi)))
     if poly:
         return out
     # ponytail: "melody = highest note at each onset" is naive; a real melody extractor would be the upgrade.
@@ -283,20 +273,15 @@ def _part(notes, inst, cl, ts, ks, cls=stream.Part):
         part.insert(0, obj)
     if notes:
         for el in raw.chordify().flatten().notes:
-            if isinstance(el, chord.Chord) and len(el.pitches) == 1:
-                el = _single(el)
-            part.insert(el.offset, el)
+            if isinstance(el, chord.Chord) and len(el.pitches) == 1:  # a one-pitch chord is written as a note
+                n = note.Note(el.pitches[0], duration=el.duration)
+                n.tie = el.tie
+                part.insert(el.offset, n)
+            else:
+                part.insert(el.offset, el)
     else:
         part.insert(0, note.Rest(quarterLength=4))
     return part
-
-
-def _single(c):
-    n = note.Note(c.pitches[0])
-    n.duration = c.duration
-    n.tie = c.tie
-    n.offset = c.offset
-    return n
 
 
 def build_score(notes, bpm, name="piano", title="Transcription", to_beats=None):
@@ -365,7 +350,7 @@ def transcribe(src, out_dir, name="piano", bpm=None, source="piano"):
         to_beats, bpm = _tempo_map(notes, beats)
     score = build_score(notes, bpm, name, Path(src).stem, to_beats)
     score.write("midi", fp=out_dir / "score.mid")  # MIDI stays at sounding pitch
-    if score.parts[0].atSoundingPitch is True:
+    if name != "piano":  # Bb/Eb instruments are written transposed
         score = score.toWrittenPitch()
     score.write("musicxml", fp=out_dir / "score.musicxml")
     return {"notes": len(notes), "bpm": bpm, "instrument": name}
